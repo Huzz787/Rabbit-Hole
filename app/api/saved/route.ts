@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma, sanitizeConnectionError } from "@/lib/database/prisma";
+import { prisma, sanitizeConnectionError, withQueryTimeout } from "@/lib/database/prisma";
 import { extractServerSessionId } from "@/lib/utils/serverSession";
 import { z } from "zod";
 
@@ -22,14 +22,19 @@ export async function GET(req: NextRequest) {
     const rawSessionId = searchParams.get("sessionId");
     const sessionId = extractServerSessionId(req, rawSessionId);
 
-    const saved = await prisma.savedDiscoveries.findMany({
-      where: { sessionId },
-      orderBy: { savedAt: "desc" },
-      take: 50,
-      include: {
-        topic: true,
-      },
-    });
+    const saved = await withQueryTimeout(
+      () =>
+        prisma.savedDiscoveries.findMany({
+          where: { sessionId },
+          orderBy: { savedAt: "desc" },
+          take: 50,
+          include: {
+            topic: true,
+          },
+        }),
+      3500,
+      []
+    );
 
     return NextResponse.json({ saved, count: saved.length, sessionId });
   } catch (err) {
@@ -53,25 +58,37 @@ export async function POST(req: NextRequest) {
     const { sessionId: rawSessionId, topicId, notes } = SaveDiscoverySchema.parse(body);
     const sessionId = extractServerSessionId(req, rawSessionId);
 
-    const record = await prisma.savedDiscoveries.upsert({
-      where: {
-        sessionId_topicId: {
-          sessionId,
-          topicId,
-        },
-      },
-      create: {
-        sessionId,
-        topicId,
-        notes,
-      },
-      update: {
-        notes: notes || undefined,
-      },
-      include: {
-        topic: true,
-      },
-    });
+    const record = await withQueryTimeout(
+      () =>
+        prisma.savedDiscoveries.upsert({
+          where: {
+            sessionId_topicId: {
+              sessionId,
+              topicId,
+            },
+          },
+          create: {
+            sessionId,
+            topicId,
+            notes,
+          },
+          update: {
+            notes: notes || undefined,
+          },
+          include: {
+            topic: true,
+          },
+        }),
+      3500,
+      null
+    );
+
+    if (!record) {
+      return NextResponse.json(
+        { error: "Database save operation timed out." },
+        { status: 504 }
+      );
+    }
 
     return NextResponse.json({ record });
   } catch (err) {
@@ -106,12 +123,17 @@ export async function DELETE(req: NextRequest) {
       );
     }
 
-    await prisma.savedDiscoveries.deleteMany({
-      where: {
-        sessionId,
-        topicId,
-      },
-    });
+    await withQueryTimeout(
+      () =>
+        prisma.savedDiscoveries.deleteMany({
+          where: {
+            sessionId,
+            topicId,
+          },
+        }),
+      3500,
+      null
+    );
 
     return NextResponse.json({ success: true });
   } catch (err) {

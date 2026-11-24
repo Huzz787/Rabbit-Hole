@@ -12,6 +12,7 @@ export function sanitizeConnectionError(error: unknown): string {
   return str.replace(/postgresql:\/\/[^:]+:([^@]+)@/gi, "postgresql://****:****@");
 }
 
+// Reuse connection across warm serverless lambdas to prevent Aiven connection pool exhaustion
 export const prisma =
   globalForPrisma.prisma ??
   new PrismaClient({
@@ -21,7 +22,42 @@ export const prisma =
         : ["error"],
   });
 
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+globalForPrisma.prisma = prisma;
+
+/**
+ * Database query timeout wrapper.
+ *
+ * NOTE ON QUERY CANCELLATION LIMITATION:
+ * JavaScript Promise.race allows the API route to unblock and return an HTTP response
+ * within the serverless deadline, but it does NOT cancel the in-flight query on the
+ * remote PostgreSQL connection wire. The database engine will continue processing
+ * until statement_timeout or completion.
+ *
+ * An error handler (.catch) is attached to the query promise to safely swallow any
+ * late post-timeout rejections and avoid unhandled rejection warnings in serverless runtimes.
+ */
+export async function withQueryTimeout<T>(
+  queryFn: () => Promise<T>,
+  timeoutMs = 4000,
+  fallbackValue: T
+): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(fallbackValue);
+    }, timeoutMs);
+  });
+
+  const queryPromise = queryFn();
+  // Prevent unhandled rejections if the underlying database call fails after the timeout resolves
+  queryPromise.catch(() => {});
+
+  try {
+    return await Promise.race([queryPromise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
  * Safe database connection test helper
@@ -39,7 +75,7 @@ export async function testDatabaseConnection(): Promise<{
   }
 
   try {
-    await prisma.$queryRaw`SELECT 1`;
+    await withQueryTimeout(() => prisma.$queryRaw`SELECT 1`, 3000, null);
     return {
       connected: true,
       message: "Successfully connected to Aiven PostgreSQL.",

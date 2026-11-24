@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma, sanitizeConnectionError } from "@/lib/database/prisma";
+import { prisma, sanitizeConnectionError, withQueryTimeout } from "@/lib/database/prisma";
 import { z } from "zod";
 
 const CreateTopicSchema = z.object({
@@ -31,20 +31,25 @@ export async function GET(req: NextRequest) {
       where.category = { equals: category, mode: "insensitive" };
     }
 
-    const topics = await prisma.topic.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      take: 50,
-      include: {
-        _count: {
-          select: {
-            outgoingConnections: true,
-            incomingConnections: true,
-            savedDiscoveries: true,
+    const topics = await withQueryTimeout(
+      () =>
+        prisma.topic.findMany({
+          where,
+          orderBy: { createdAt: "desc" },
+          take: 50,
+          include: {
+            _count: {
+              select: {
+                outgoingConnections: true,
+                incomingConnections: true,
+                savedDiscoveries: true,
+              },
+            },
           },
-        },
-      },
-    });
+        }),
+      3500,
+      []
+    );
 
     return NextResponse.json({ topics, count: topics.length });
   } catch (err) {
@@ -67,22 +72,34 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const validated = CreateTopicSchema.parse(body);
 
-    const topic = await prisma.topic.upsert({
-      where: { title: validated.title },
-      create: {
-        title: validated.title,
-        name: validated.title,
-        category: validated.category,
-        description: validated.description,
-        summary: validated.summary,
-        depth: validated.depth,
-      },
-      update: {
-        category: validated.category,
-        description: validated.description || undefined,
-        summary: validated.summary || undefined,
-      },
-    });
+    const topic = await withQueryTimeout(
+      () =>
+        prisma.topic.upsert({
+          where: { title: validated.title },
+          create: {
+            title: validated.title,
+            name: validated.title,
+            category: validated.category,
+            description: validated.description,
+            summary: validated.summary,
+            depth: validated.depth,
+          },
+          update: {
+            category: validated.category,
+            description: validated.description || undefined,
+            summary: validated.summary || undefined,
+          },
+        }),
+      3500,
+      null
+    );
+
+    if (!topic) {
+      return NextResponse.json(
+        { error: "Database operation timed out." },
+        { status: 504 }
+      );
+    }
 
     return NextResponse.json({ topic });
   } catch (err) {

@@ -118,42 +118,89 @@ export const EXPLORATION_PREVIEWS: Record<
     summary:
       "A black hole is a volume of spacetime where gravity is so intense that nothing—no particles, light, or electromagnetic radiation—can escape its boundary.",
     category: "Astrophysics",
-    relatedNodes: ["Event Horizons", "Hawking Radiation", "Spacetime Wormholes", "Dark Matter & Energy"],
+    relatedNodes: [
+      "Event Horizons",
+      "Hawking Radiation",
+      "Spacetime Wormholes",
+      "Dark Matter & Energy",
+      "Gravitational Singularity",
+      "Accretion Disks",
+      "General Relativity",
+      "Information Paradox",
+    ],
     deepDivePrompt: "Explore the breakdown of general relativity at the gravitational singularity.",
   },
   "quantum-computing": {
     summary:
       "Quantum computers exploit the unique properties of quantum states—specifically superposition, interference, and entanglement—to resolve intractable computational puzzles.",
     category: "Quantum Physics",
-    relatedNodes: ["Superposition", "Quantum Entanglement", "Many-Worlds Interpretation", "It From Bit"],
+    relatedNodes: [
+      "Superposition",
+      "Quantum Entanglement",
+      "Many-Worlds Interpretation",
+      "It From Bit",
+      "Quantum Decoherence",
+      "Topological Qubits",
+      "Quantum Supremacy",
+    ],
     deepDivePrompt: "Explore quantum decoherence and multiversal interference patterns.",
   },
   "the-simulation-hypothesis": {
     summary:
       "Philosophical proposition suggesting reality could be an artificial simulator created by an advanced civilization with astronomical computing power.",
     category: "Philosophy",
-    relatedNodes: ["Bostrom's Trilemma", "It From Bit", "Lucid Dreaming", "Quantum Computing"],
+    relatedNodes: [
+      "Bostrom's Trilemma",
+      "It From Bit",
+      "Lucid Dreaming",
+      "Quantum Computing",
+      "Planck Length Limits",
+      "Holographic Universe",
+      "Digital Physics",
+    ],
     deepDivePrompt: "Examine whether pixelated Planck length is evidence of computational quantization.",
   },
   "psychology-of-dreams": {
     summary:
       "Investigating dream states reveals profound links between memory pruning, emotional regulation, theta-wave neurochemistry, and altered self-awareness.",
     category: "Consciousness",
-    relatedNodes: ["Lucid Dreaming", "Hard Problem of Consciousness", "Neural Plasticity"],
+    relatedNodes: [
+      "Lucid Dreaming",
+      "Hard Problem of Consciousness",
+      "Neural Plasticity",
+      "Hypnagogic Hallucinations",
+      "Default Mode Network",
+      "Subconscious Cognitive Architecture",
+    ],
     deepDivePrompt: "Investigate whether dreams simulate existential threats for evolutionary resilience.",
   },
   "lost-civilizations": {
     summary:
       "Examining astronomical alignments, submerged coastal structures, and anomalous precision stonework from the Younger Dryas boundary.",
     category: "Ancient Enigmas",
-    relatedNodes: ["Antikythera Mechanism", "The Voynich Manuscript", "Curiosity"],
+    relatedNodes: [
+      "Antikythera Mechanism",
+      "The Voynich Manuscript",
+      "Göbekli Tepe",
+      "Younger Dryas Boundary",
+      "Ancient Megaliths",
+      "Underwater Archaeology",
+    ],
     deepDivePrompt: "Analyze the sudden emergence of monumental architecture at Göbekli Tepe.",
   },
   "the-fermi-paradox": {
     summary:
       "The eerie contradiction between the billions of habitable worlds in our galaxy and the complete absence of detected technological signatures.",
     category: "Astrobiology",
-    relatedNodes: ["Kardashev Scale", "Bostrom's Trilemma", "Extremophiles", "Black Holes"],
+    relatedNodes: [
+      "Kardashev Scale",
+      "Bostrom's Trilemma",
+      "Extremophiles",
+      "The Great Filter",
+      "Dyson Spheres",
+      "Von Neumann Probes",
+      "Rare Earth Hypothesis",
+    ],
     deepDivePrompt: "Discover the Great Filter: Are we past the impossible barrier or is it ahead?",
   },
 };

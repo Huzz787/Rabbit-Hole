@@ -4,7 +4,6 @@ import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { Search, Sparkles, Shuffle, ArrowRight, Compass, Loader2 } from "lucide-react";
-import { SURPRISE_TOPICS } from "@/lib/data/curatedTopics";
 
 export function HeroSection() {
   const router = useRouter();
@@ -25,11 +24,36 @@ export function HeroSection() {
     router.push(`/explore?topic=${encodeURIComponent(trimmed)}`);
   };
 
-  const handleSurpriseMe = () => {
+  const handleSurpriseMe = async () => {
     setIsNavigating(true);
-    const randomIndex = Math.floor(Math.random() * SURPRISE_TOPICS.length);
-    const selected = SURPRISE_TOPICS[randomIndex];
-    router.push(`/explore?topic=${encodeURIComponent(selected)}`);
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1200);
+      const res = await fetch("/api/topics/surprise", {
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.title) {
+          router.push(`/explore?topic=${encodeURIComponent(data.title)}&from=surprise`);
+          return;
+        }
+      }
+    } catch {
+      // Fast fallback to curated list on any network lag
+    }
+    const curatedList = [
+      "Black Holes",
+      "Quantum Computing",
+      "The Simulation Hypothesis",
+      "Psychology of Dreams",
+      "Lost Civilizations",
+      "The Fermi Paradox",
+    ];
+    const selected = curatedList[Math.floor(Math.random() * curatedList.length)];
+    router.push(`/explore?topic=${encodeURIComponent(selected)}&from=surprise`);
   };
 
   const handlePillClick = (topic: string) => {

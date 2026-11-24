@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { prisma, sanitizeConnectionError } from "@/lib/database/prisma";
+import { prisma, sanitizeConnectionError, withQueryTimeout } from "@/lib/database/prisma";
 import { SAMPLE_KNOWLEDGE_GRAPH } from "@/lib/data/sampleKnowledgeGraph";
 
 export async function GET() {
@@ -12,12 +12,17 @@ export async function GET() {
       });
     }
 
-    const topics = await prisma.topic.findMany({
-      orderBy: { createdAt: "desc" },
-      take: 120,
-    });
+    const topics = await withQueryTimeout(
+      () =>
+        prisma.topic.findMany({
+          orderBy: { createdAt: "desc" },
+          take: 120,
+        }),
+      3500,
+      []
+    );
 
-    if (topics.length === 0) {
+    if (!topics || topics.length === 0) {
       return NextResponse.json({
         ...SAMPLE_KNOWLEDGE_GRAPH,
         source: "fallback",
@@ -26,12 +31,17 @@ export async function GET() {
     }
 
     const topicIds = topics.map((t) => t.id);
-    const connections = await prisma.topicConnection.findMany({
-      where: {
-        sourceTopicId: { in: topicIds },
-        targetTopicId: { in: topicIds },
-      },
-    });
+    const connections = await withQueryTimeout(
+      () =>
+        prisma.topicConnection.findMany({
+          where: {
+            sourceTopicId: { in: topicIds },
+            targetTopicId: { in: topicIds },
+          },
+        }),
+      3500,
+      []
+    );
 
     const nodes = topics.map((t) => ({
       id: t.id,
@@ -43,7 +53,7 @@ export async function GET() {
       depth: t.depth,
     }));
 
-    const links = connections.map((c) => ({
+    const links = (connections || []).map((c) => ({
       source: c.sourceTopicId,
       target: c.targetTopicId,
       relationship: c.relationship || "Connected",

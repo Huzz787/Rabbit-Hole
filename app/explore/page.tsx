@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, Suspense } from "react";
+import React, { useState, useEffect, Suspense, useCallback } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -16,6 +16,7 @@ import {
   CheckCircle2,
   Loader2,
   AlertTriangle,
+  RotateCcw,
 } from "lucide-react";
 import { EXPLORATION_PREVIEWS } from "@/lib/data/curatedTopics";
 import { useSessionId } from "@/lib/utils/session";
@@ -37,29 +38,79 @@ interface TopicData {
   relatedTopics: RelatedTopicItem[];
 }
 
+function getCuratedDataForTopic(topic: string): TopicData {
+  const slug = topic.toLowerCase().replace(/\s+/g, "-");
+  const curated = EXPLORATION_PREVIEWS[slug] || {
+    summary: `Exploration of ${topic} reveals profound intersections between physical reality, consciousness, and computational information.`,
+    category: "Cosmic Frontier",
+    relatedNodes: ["Quantum Foundations", "Cosmic Entropy", "Epistemology", "Information Theory", "Event Horizons"],
+    deepDivePrompt: `Discover how ${topic} bridges cosmological physics and theoretical computing.`,
+  };
+
+  return {
+    title: topic,
+    category: curated.category,
+    description: `A frontier inquiry into ${topic} and its unexpected implications across physical and philosophical boundaries.`,
+    summary: curated.summary,
+    facts: [
+      `${topic} challenges classical assumptions about how spacetime, entropy, and information behave.`,
+      `Observational breakthroughs continue to reveal anomalous dynamics at the frontier of ${topic}.`,
+      `Theoretical models suggest ${topic} may hold the key to unifying quantum mechanics and gravity.`,
+    ],
+    exploreNext: [
+      `What happens to quantum information at the extreme boundaries of ${topic}?`,
+      `How does an observer's frame of reference transform understanding of ${topic}?`,
+      `Could ${topic} be an emergent manifestation of holographic spacetime?`,
+    ],
+    relatedTopics: curated.relatedNodes.map((rn) => ({
+      title: rn,
+      relationship: "Interconnected Frontier",
+      category: curated.category,
+      summary: `Exploring the unexpected theoretical bridges with ${rn}.`,
+    })),
+  };
+}
+
 function ExploreContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const initialTopic = searchParams.get("topic") || "Black Holes";
+  const activeTopic = searchParams.get("topic") || "Black Holes";
   const sessionId = useSessionId();
 
   const [inputTopic, setInputTopic] = useState("");
-  const [activeTopic, setActiveTopic] = useState(initialTopic);
   const [isSaved, setIsSaved] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [databaseStatus, setDatabaseStatus] = useState<"connected" | "offline">("connected");
   const [isSynthesizing, setIsSynthesizing] = useState(true);
-  const [topicData, setTopicData] = useState<TopicData | null>(null);
+  const [topicData, setTopicData] = useState<TopicData | null>(() => {
+    // If it's a known curated topic, start with preview for instant perceived load
+    const slug = (searchParams.get("topic") || "Black Holes").toLowerCase().replace(/\s+/g, "-");
+    if (EXPLORATION_PREVIEWS[slug]) {
+      return getCuratedDataForTopic(searchParams.get("topic") || "Black Holes");
+    }
+    return null;
+  });
+  const [noticeMessage, setNoticeMessage] = useState<string | null>(null);
+  const [retryTrigger, setRetryTrigger] = useState(0);
 
-  // Sync with Aiven & Gemini: fetch AI expansion
+  // Sync with Aiven & Gemini: fetch AI expansion with strict client timeout and AbortController
   useEffect(() => {
     let isMounted = true;
+    const controller = new AbortController();
+    const CLIENT_TIMEOUT_MS = 8000;
+
+    const timeoutId = setTimeout(() => {
+      console.warn(`[Client Timeout] Exploration request for "${activeTopic}" exceeded ${CLIENT_TIMEOUT_MS}ms. Aborting.`);
+      controller.abort();
+    }, CLIENT_TIMEOUT_MS);
+
     Promise.resolve().then(() => {
       if (isMounted) {
         setIsSynthesizing(true);
         setIsSaved(false);
         setSaveError(null);
+        setNoticeMessage(null);
       }
     });
 
@@ -74,8 +125,12 @@ function ExploreContent() {
           body: JSON.stringify({
             topicTitle: activeTopic,
             sessionId,
+            forceRefresh: retryTrigger > 0,
           }),
+          signal: controller.signal,
         });
+
+        clearTimeout(timeoutId);
 
         if (res.ok && isMounted) {
           const data = await res.json();
@@ -99,44 +154,26 @@ function ExploreContent() {
             return;
           }
         } else if (res.status === 503) {
-          setDatabaseStatus("offline");
+          if (isMounted) setDatabaseStatus("offline");
+        } else if (isMounted) {
+          setNoticeMessage("AI service is temporarily busy. Displaying verified discovery.");
         }
-      } catch {
-        setDatabaseStatus("offline");
+      } catch (err: unknown) {
+        clearTimeout(timeoutId);
+        const isAbort = err instanceof Error && (err.name === "AbortError" || err.message.includes("aborted"));
+        if (isMounted) {
+          if (isAbort) {
+            setNoticeMessage("AI synthesis took longer than expected. Displaying verified discovery.");
+          } else {
+            setDatabaseStatus("offline");
+            setNoticeMessage("Connection interrupted. Displaying verified discovery.");
+          }
+        }
       }
 
       if (isMounted) {
-        // Fallback to curated topics
-        const slug = activeTopic.toLowerCase().replace(/\s+/g, "-");
-        const curated = EXPLORATION_PREVIEWS[slug] || {
-          summary: `Exploration of ${activeTopic} reveals profound intersections between physical reality, consciousness, and computational information.`,
-          category: "Cosmic Frontier",
-          relatedNodes: ["Quantum Foundations", "Cosmic Entropy", "Epistemology", "Information Theory"],
-          deepDivePrompt: `Discover how ${activeTopic} bridges cosmological physics and theoretical computing.`,
-        };
-
-        setTopicData({
-          title: activeTopic,
-          category: curated.category,
-          description: `A frontier inquiry into ${activeTopic} and its unexpected implications across physical and philosophical boundaries.`,
-          summary: curated.summary,
-          facts: [
-            `${activeTopic} challenges classical assumptions about how spacetime, entropy, and information behave.`,
-            `Observational breakthroughs continue to reveal anomalous dynamics at the frontier of ${activeTopic}.`,
-            `Theoretical models suggest ${activeTopic} may hold the key to unifying quantum mechanics and gravity.`,
-          ],
-          exploreNext: [
-            `What happens to quantum information at the extreme boundaries of ${activeTopic}?`,
-            `How does an observer's frame of reference transform understanding of ${activeTopic}?`,
-            `Could ${activeTopic} be an emergent manifestation of holographic spacetime?`,
-          ],
-          relatedTopics: curated.relatedNodes.map((rn) => ({
-            title: rn,
-            relationship: "Interconnected Frontier",
-            category: curated.category,
-            summary: `Exploring the unexpected theoretical bridges with ${rn}.`,
-          })),
-        });
+        // Guaranteed fallback ensures screen is never left blank or stuck
+        setTopicData((prev) => prev || getCuratedDataForTopic(activeTopic));
         setIsSynthesizing(false);
       }
     }
@@ -145,8 +182,10 @@ function ExploreContent() {
 
     return () => {
       isMounted = false;
+      clearTimeout(timeoutId);
+      controller.abort();
     };
-  }, [activeTopic, sessionId]);
+  }, [activeTopic, sessionId, retryTrigger]);
 
   const handleSaveToggle = async () => {
     if (!topicData) return;
@@ -204,7 +243,6 @@ function ExploreContent() {
     if (inputTopic.trim()) {
       setIsSynthesizing(true);
       const nextTopic = inputTopic.trim();
-      setActiveTopic(nextTopic);
       router.push(`/explore?topic=${encodeURIComponent(nextTopic)}`);
       setInputTopic("");
     }
@@ -212,9 +250,13 @@ function ExploreContent() {
 
   const handleRelatedClick = (topicName: string) => {
     setIsSynthesizing(true);
-    setActiveTopic(topicName);
     router.push(`/explore?topic=${encodeURIComponent(topicName)}`);
   };
+
+  const handleRetry = useCallback(() => {
+    setNoticeMessage(null);
+    setRetryTrigger((prev) => prev + 1);
+  }, []);
 
   return (
     <div className="w-full max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
@@ -247,6 +289,23 @@ function ExploreContent() {
           </button>
         </div>
       </div>
+
+      {/* Notice / Latency Fallback Alert Banner */}
+      {noticeMessage && (
+        <div className="mb-6 p-3.5 rounded-xl bg-cyan-950/40 border border-cyan-500/40 text-cyan-300 text-xs flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0 text-cyan-400" />
+            <span>{noticeMessage}</span>
+          </div>
+          <button
+            onClick={handleRetry}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-500/40 font-medium transition-all"
+          >
+            <RotateCcw className="w-3 h-3" />
+            <span>Retry AI Synthesis</span>
+          </button>
+        </div>
+      )}
 
       {/* Save Error Alert Banner */}
       {saveError && (
@@ -322,7 +381,7 @@ function ExploreContent() {
             </div>
           </div>
 
-          {/* CIRCLE LOADING STATE WHEN SEARCHING SMG AGAIN */}
+          {/* CIRCLE LOADING STATE WHEN SEARCHING */}
           {isSynthesizing ? (
             <div className="min-h-[380px] flex flex-col items-center justify-center gap-5 text-center py-16 animate-pulse">
               <div className="relative flex items-center justify-center">

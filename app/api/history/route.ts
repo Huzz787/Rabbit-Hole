@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma, sanitizeConnectionError } from "@/lib/database/prisma";
+import { prisma, sanitizeConnectionError, withQueryTimeout } from "@/lib/database/prisma";
 import { extractServerSessionId } from "@/lib/utils/serverSession";
 import { z } from "zod";
 
@@ -21,21 +21,26 @@ export async function GET(req: NextRequest) {
     const rawSessionId = searchParams.get("sessionId");
     const sessionId = extractServerSessionId(req, rawSessionId);
 
-    const history = await prisma.explorationHistory.findMany({
-      where: { sessionId },
-      orderBy: { exploredAt: "desc" },
-      take: 50,
-      include: {
-        topic: {
-          select: {
-            id: true,
-            title: true,
-            category: true,
-            summary: true,
+    const history = await withQueryTimeout(
+      () =>
+        prisma.explorationHistory.findMany({
+          where: { sessionId },
+          orderBy: { exploredAt: "desc" },
+          take: 50,
+          include: {
+            topic: {
+              select: {
+                id: true,
+                title: true,
+                category: true,
+                summary: true,
+              },
+            },
           },
-        },
-      },
-    });
+        }),
+      3500,
+      []
+    );
 
     return NextResponse.json({ history, count: history.length, sessionId });
   } catch (err) {
@@ -59,15 +64,27 @@ export async function POST(req: NextRequest) {
     const { sessionId: rawSessionId, topicId } = RecordHistorySchema.parse(body);
     const sessionId = extractServerSessionId(req, rawSessionId);
 
-    const record = await prisma.explorationHistory.create({
-      data: {
-        sessionId,
-        topicId,
-      },
-      include: {
-        topic: true,
-      },
-    });
+    const record = await withQueryTimeout(
+      () =>
+        prisma.explorationHistory.create({
+          data: {
+            sessionId,
+            topicId,
+          },
+          include: {
+            topic: true,
+          },
+        }),
+      3500,
+      null
+    );
+
+    if (!record) {
+      return NextResponse.json(
+        { error: "Database history recording timed out." },
+        { status: 504 }
+      );
+    }
 
     return NextResponse.json({ record });
   } catch (err) {
