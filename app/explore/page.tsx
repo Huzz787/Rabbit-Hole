@@ -18,7 +18,7 @@ import {
   AlertTriangle,
   RotateCcw,
 } from "lucide-react";
-import { EXPLORATION_PREVIEWS } from "@/lib/data/curatedTopics";
+import { EXPLORATION_PREVIEWS, getCuratedTopic } from "@/lib/data/curatedTopics";
 import { useSessionId } from "@/lib/utils/session";
 
 interface RelatedTopicItem {
@@ -36,38 +36,40 @@ interface TopicData {
   facts: string[];
   exploreNext: string[];
   relatedTopics: RelatedTopicItem[];
+  isFallback?: boolean;
 }
 
 function getCuratedDataForTopic(topic: string): TopicData {
-  const slug = topic.toLowerCase().replace(/\s+/g, "-");
-  const curated = EXPLORATION_PREVIEWS[slug] || {
-    summary: `Exploration of ${topic} reveals profound intersections between physical reality, consciousness, and computational information.`,
-    category: "Cosmic Frontier",
-    relatedNodes: ["Quantum Foundations", "Cosmic Entropy", "Epistemology", "Information Theory", "Event Horizons"],
-    deepDivePrompt: `Discover how ${topic} bridges cosmological physics and theoretical computing.`,
-  };
+  const curated = getCuratedTopic(topic);
+  if (curated) {
+    return {
+      title: curated.title,
+      category: curated.category,
+      description: curated.description,
+      summary: curated.summary,
+      facts: curated.facts,
+      exploreNext: curated.exploreNext,
+      relatedTopics: curated.relatedTopics,
+      isFallback: true,
+    };
+  }
 
+  const titleCap = topic.trim().charAt(0).toUpperCase() + topic.trim().slice(1);
   return {
-    title: topic,
-    category: curated.category,
-    description: `A frontier inquiry into ${topic} and its unexpected implications across physical and philosophical boundaries.`,
-    summary: curated.summary,
+    title: titleCap,
+    category: "General Knowledge",
+    description: `Exploration entry for "${titleCap}".`,
+    summary: `Dynamic synthesis for "${titleCap}" is actively initializing. Foundational discovery pathways are provided below.`,
     facts: [
-      `${topic} challenges classical assumptions about how spacetime, entropy, and information behave.`,
-      `Observational breakthroughs continue to reveal anomalous dynamics at the frontier of ${topic}.`,
-      `Theoretical models suggest ${topic} may hold the key to unifying quantum mechanics and gravity.`,
+      `"${titleCap}" is an active inquiry node in the knowledge universe.`,
+      `Dynamic multi-disciplinary synthesis will automatically complete when the AI service connection stabilizes.`,
     ],
     exploreNext: [
-      `What happens to quantum information at the extreme boundaries of ${topic}?`,
-      `How does an observer's frame of reference transform understanding of ${topic}?`,
-      `Could ${topic} be an emergent manifestation of holographic spacetime?`,
+      `What primary mechanisms or principles define ${titleCap}?`,
+      `How does ${titleCap} connect with surrounding domains?`,
     ],
-    relatedTopics: curated.relatedNodes.map((rn) => ({
-      title: rn,
-      relationship: "Interconnected Frontier",
-      category: curated.category,
-      summary: `Exploring the unexpected theoretical bridges with ${rn}.`,
-    })),
+    relatedTopics: [],
+    isFallback: true,
   };
 }
 
@@ -98,7 +100,9 @@ function ExploreContent() {
   useEffect(() => {
     let isMounted = true;
     const controller = new AbortController();
-    const CLIENT_TIMEOUT_MS = 8000;
+    // Coordinated with backend maximum budget (9.5s) plus network buffer
+    const CLIENT_TIMEOUT_MS = 11000;
+    const clientStartTime = Date.now();
 
     const timeoutId = setTimeout(() => {
       console.warn(`[Client Timeout] Exploration request for "${activeTopic}" exceeded ${CLIENT_TIMEOUT_MS}ms. Aborting.`);
@@ -121,11 +125,13 @@ function ExploreContent() {
           headers: {
             "Content-Type": "application/json",
             "x-session-id": sessionId,
+            "x-request-start": clientStartTime.toString(),
           },
           body: JSON.stringify({
             topicTitle: activeTopic,
             sessionId,
             forceRefresh: retryTrigger > 0,
+            clientTimestamp: clientStartTime,
           }),
           signal: controller.signal,
         });
@@ -141,15 +147,24 @@ function ExploreContent() {
           }
 
           if (data.expansion) {
+            const isFallback = Boolean(data.expansion.isFallback);
             setTopicData({
               title: data.expansion.title || activeTopic,
-              category: data.expansion.category || "Cosmic Frontier",
+              category: data.expansion.category || "General Knowledge",
               description: data.expansion.description || "",
               summary: data.expansion.summary || "",
               facts: data.expansion.facts || [],
               exploreNext: data.expansion.exploreNext || [],
               relatedTopics: data.expansion.relatedTopics || [],
+              isFallback,
             });
+
+            if (isFallback) {
+              setNoticeMessage("Displaying verified curated preview. You can retry dynamic AI synthesis anytime.");
+            } else {
+              setNoticeMessage(null);
+            }
+
             setIsSynthesizing(false);
             return;
           }
@@ -371,6 +386,11 @@ function ExploreContent() {
                 <div className="flex items-center gap-1.5 text-cyan-400 bg-cyan-950/40 px-3 py-1 rounded-full border border-cyan-500/30">
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   <span>Synthesizing with Gemini AI...</span>
+                </div>
+              ) : topicData?.isFallback ? (
+                <div className="flex items-center gap-1.5 text-cyan-300 bg-cyan-950/40 px-3 py-1 rounded-full border border-cyan-500/30">
+                  <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Curated Preview</span>
                 </div>
               ) : (
                 <div className="flex items-center gap-1.5 text-emerald-400 bg-emerald-950/40 px-3 py-1 rounded-full border border-emerald-500/30">

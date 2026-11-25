@@ -1,8 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma, sanitizeConnectionError } from "@/lib/database/prisma";
-import { expandTopicWithGemini, TopicExpansionResult } from "@/lib/gemini/service";
+import {
+  expandTopicWithGemini,
+  GeminiExpansionOutput,
+} from "@/lib/gemini/service";
+import { getCuratedTopic } from "@/lib/data/curatedTopics";
 import { extractServerSessionId } from "@/lib/utils/serverSession";
 import { z } from "zod";
+
+// Vercel serverless function maximum execution duration limit
+export const maxDuration = 15;
 
 // Input validation schema with length constraints
 const ExpandRequestSchema = z.object({
@@ -13,6 +20,7 @@ const ExpandRequestSchema = z.object({
     .max(100, "topicTitle cannot exceed 100 characters"),
   sessionId: z.string().trim().max(100).optional(),
   forceRefresh: z.boolean().optional().default(false),
+  clientTimestamp: z.number().optional(),
 });
 
 // Sliding window rate limiter (max 60 requests per minute per IP / Session)
@@ -47,10 +55,27 @@ const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes TTL
 const MAX_CACHE_ENTRIES = 300;
 
 // Request coalescing map to prevent duplicate simultaneous generation for the exact same topic
-const inFlightExpansions = new Map<string, Promise<TopicExpansionResult>>();
+const inFlightExpansions = new Map<string, Promise<GeminiExpansionOutput>>();
 
 // Safe database timeout wrapper
-async function withDbTimeout<T>(promise: Promise<T>, timeoutMs = 3500, fallback: T): Promise<T> {
+/**
+ * Safe database timeout wrapper.
+ * NOTE: Promise.race bounds JavaScript execution wait time in Node.js;
+ * it does NOT cancel the underlying PostgreSQL query over the wire/TCP connection.
+ * We attach a suppressed catch handler to the database promise so that any post-timeout
+ * query rejections or network errors are cleanly caught and cannot trigger
+ * unhandled promise rejections in Node.js.
+ */
+async function withDbTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs = 3000,
+  fallback: T
+): Promise<T> {
+  // Prevent unhandled promise rejections if the background database query later fails after timeout
+  promise.catch((err) => {
+    console.warn("[DB Suppressed Post-Timeout]", sanitizeConnectionError(err));
+  });
+
   let timer: NodeJS.Timeout | null = null;
   const timeoutPromise = new Promise<T>((resolve) => {
     timer = setTimeout(() => {
@@ -62,6 +87,9 @@ async function withDbTimeout<T>(promise: Promise<T>, timeoutMs = 3500, fallback:
   try {
     const result = await Promise.race([promise, timeoutPromise]);
     return result;
+  } catch (err) {
+    console.warn("[DB Error]", sanitizeConnectionError(err));
+    return fallback;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -69,15 +97,29 @@ async function withDbTimeout<T>(promise: Promise<T>, timeoutMs = 3500, fallback:
 
 export async function POST(req: NextRequest) {
   const routeStart = performance.now();
+  let clientStartMs: number | null = null;
 
   try {
     const body = await req.json();
-    const { topicTitle, sessionId: rawSessionId, forceRefresh } = ExpandRequestSchema.parse(body);
+    const { topicTitle, sessionId: rawSessionId, forceRefresh, clientTimestamp } =
+      ExpandRequestSchema.parse(body);
     const sessionId = extractServerSessionId(req, rawSessionId);
     const normalizedKey = topicTitle.toLowerCase().trim();
 
+    if (clientTimestamp && typeof clientTimestamp === "number") {
+      clientStartMs = clientTimestamp;
+    } else {
+      const headerClientTime = req.headers.get("x-request-start");
+      if (headerClientTime) {
+        clientStartMs = parseInt(headerClientTime, 10) || null;
+      }
+    }
+
     // Rate limiting check
-    const clientIp = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || sessionId || "anon";
+    const clientIp =
+      req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+      sessionId ||
+      "anon";
     if (!checkRateLimit(clientIp)) {
       console.warn(`[RateLimit] Blocked request from ${clientIp} for "${topicTitle}"`);
       return NextResponse.json(
@@ -101,10 +143,22 @@ export async function POST(req: NextRequest) {
             .catch(() => {});
         }
 
+        const frontendDuration = clientStartMs ? Math.round(Date.now() - clientStartMs) : null;
         return NextResponse.json({
           ...cached.payload,
           source: "memory-cache",
           latencyMs: cacheHitMs,
+          telemetry: {
+            totalApiMs: cacheHitMs,
+            frontendRequestDurationMs: frontendDuration,
+            dbLookupMs: 0,
+            geminiMs: 0,
+            geminiAttempts: 0,
+            geminiModel: "memory-cache",
+            usedFallback: false,
+            dbRootUpdateMs: 0,
+            dbRelatedUpsertMs: 0,
+          },
         });
       }
     }
@@ -115,12 +169,14 @@ export async function POST(req: NextRequest) {
       const expansion = await expandTopicWithGemini(topicTitle, []);
       const aiMs = Math.round(performance.now() - aiStart);
       const totalMs = Math.round(performance.now() - routeStart);
+      const frontendDuration = clientStartMs ? Math.round(Date.now() - clientStartMs) : null;
 
       console.log(`[Offline Fallback] Completed "${topicTitle}" in ${totalMs}ms (AI: ${aiMs}ms)`);
       return NextResponse.json({
         source: "offline-fallback",
         databaseStatus: "offline",
-        warning: "Database is offline. Discoveries and graph nodes are temporary and not saved permanently.",
+        warning:
+          "Database is offline. Discoveries and graph nodes are temporary and not saved permanently.",
         topic: {
           id: `virtual-${Date.now()}`,
           title: expansion.title,
@@ -139,6 +195,17 @@ export async function POST(req: NextRequest) {
           relationship: rt.relationship,
         })),
         latencyMs: totalMs,
+        telemetry: {
+          totalApiMs: totalMs,
+          frontendRequestDurationMs: frontendDuration,
+          dbLookupMs: 0,
+          geminiMs: expansion.timing?.durationMs || aiMs,
+          geminiAttempts: expansion.timing?.attempts || 1,
+          geminiModel: expansion.timing?.modelUsed || "none",
+          usedFallback: expansion.timing?.usedFallback || false,
+          dbRootUpdateMs: 0,
+          dbRelatedUpsertMs: 0,
+        },
       });
     }
 
@@ -152,7 +219,7 @@ export async function POST(req: NextRequest) {
             create: {
               title: topicTitle,
               name: topicTitle,
-              category: "Cosmic Frontier",
+              category: "General Knowledge",
               depth: 1,
             },
             update: {},
@@ -181,7 +248,7 @@ export async function POST(req: NextRequest) {
         }
       };
 
-      const rootTopic = await withDbTimeout(findOrCreateRoot(), 3000, null);
+      const rootTopic = await withDbTimeout(findOrCreateRoot(), 1500, null);
       const dbLookupMs = Math.round(performance.now() - dbLookupStart);
       console.log(`[DB Lookup] Root topic lookup for "${topicTitle}" took ${dbLookupMs}ms`);
 
@@ -202,13 +269,27 @@ export async function POST(req: NextRequest) {
       const existingTitles = allExisting.map((c) => c.targetTopic.title);
 
       // Caching check: If topic already has rich details and existing connections, return immediately
-      if (!forceRefresh && rootTopic.summary && existingTitles.length >= 4) {
+      if (!forceRefresh && rootTopic.summary && existingTitles.length >= 5) {
         if (sessionId) {
           prisma.explorationHistory
             .create({ data: { sessionId, topicId: rootTopic.id } })
             .catch(() => {});
         }
         const totalMs = Math.round(performance.now() - routeStart);
+        const frontendDuration = clientStartMs ? Math.round(Date.now() - clientStartMs) : null;
+
+        // Retrieve curated facts if available to avoid returning generic filler
+        const curated = getCuratedTopic(topicTitle);
+        const resolvedFacts = curated?.facts || [
+          `${rootTopic.title} is a key discovery node with ${existingTitles.length} mapped connections in the knowledge universe.`,
+          `Observational and analytical studies continuously refine our understanding of ${rootTopic.title}.`,
+          `Interdisciplinary links connect ${rootTopic.title} directly with ${existingTitles.slice(0, 3).join(", ")}.`,
+        ];
+        const resolvedQuestions = curated?.exploreNext || [
+          `What core mechanisms govern the behavior of ${rootTopic.title}?`,
+          `How does ${rootTopic.title} link directly with ${existingTitles[0] || "connected domains"}?`,
+          `What recent breakthroughs are redefining the landscape of ${rootTopic.title}?`,
+        ];
 
         console.log(`[Aiven Cached] Returning pre-existing node "${topicTitle}" in ${totalMs}ms`);
 
@@ -218,21 +299,14 @@ export async function POST(req: NextRequest) {
           rootTopic,
           expansion: {
             title: rootTopic.title,
-            category: rootTopic.category || "Cosmic Frontier",
-            description: rootTopic.description || "",
-            summary: rootTopic.summary || "",
-            facts: [
-              `${rootTopic.title} sits at the crossroad of fundamental theory and observational unknowns.`,
-              `Deep inquiry into ${rootTopic.title} consistently reveals nonlinear relationships across physical paradigms.`,
-              `Theoretical perspectives on ${rootTopic.title} challenge conventional boundary assumptions.`,
-            ],
-            exploreNext: [
-              `What hidden constraints govern ${rootTopic.title}?`,
-              `How does observer frame alter our definition of ${rootTopic.title}?`,
-            ],
+            category: rootTopic.category || curated?.category || "General Knowledge",
+            description: rootTopic.description || curated?.description || "",
+            summary: rootTopic.summary || curated?.summary || "",
+            facts: resolvedFacts,
+            exploreNext: resolvedQuestions,
             relatedTopics: allExisting.map((c) => ({
               title: c.targetTopic.title,
-              relationship: c.relationship || "Connected Frontier",
+              relationship: c.relationship || "Connected Concept",
               category: c.targetTopic.category || "General",
               summary: c.targetTopic.summary || "",
             })),
@@ -254,6 +328,17 @@ export async function POST(req: NextRequest) {
             value: 1,
           })),
           latencyMs: totalMs,
+          telemetry: {
+            totalApiMs: totalMs,
+            frontendRequestDurationMs: frontendDuration,
+            dbLookupMs,
+            geminiMs: 0,
+            geminiAttempts: 0,
+            geminiModel: "aiven-cached",
+            usedFallback: false,
+            dbRootUpdateMs: 0,
+            dbRelatedUpsertMs: 0,
+          },
         };
 
         // Cache in memory
@@ -266,21 +351,27 @@ export async function POST(req: NextRequest) {
       let expansionPromise = inFlightExpansions.get(normalizedKey);
       if (!expansionPromise) {
         expansionPromise = expandTopicWithGemini(topicTitle, existingTitles);
+        // Safely detach cleanup handler: .then(cleanup, cleanup) handles both fulfilled and rejected
+        // states without creating a detached unhandled rejection promise
+        const cleanup = () => {
+          inFlightExpansions.delete(normalizedKey);
+        };
+        expansionPromise.then(cleanup, cleanup);
         inFlightExpansions.set(normalizedKey, expansionPromise);
       }
 
-      let expansion: TopicExpansionResult;
+      let expansion: GeminiExpansionOutput;
       try {
         expansion = await expansionPromise;
       } finally {
         inFlightExpansions.delete(normalizedKey);
       }
       const aiMs = Math.round(performance.now() - aiStart);
-      console.log(`[AI Gen] Expansion for "${topicTitle}" took ${aiMs}ms`);
+      console.log(`[AI Gen] Expansion for "${topicTitle}" took ${aiMs}ms (model: ${expansion.timing?.modelUsed}, fallback: ${expansion.timing?.usedFallback})`);
 
-      // 4. Update root topic details
+      // 4. Update root topic details with bounded timeout (max 1.2s)
       const updateRootStart = performance.now();
-      const updatedRootTopic = await prisma.topic.update({
+      const updateRootOp = prisma.topic.update({
         where: { id: rootTopic.id },
         data: {
           category: expansion.category || rootTopic.category,
@@ -288,12 +379,19 @@ export async function POST(req: NextRequest) {
           summary: expansion.summary || rootTopic.summary,
         },
       });
+      const updatedRootTopic = (await withDbTimeout(updateRootOp, 1200, rootTopic)) || rootTopic;
       const updateRootMs = Math.round(performance.now() - updateRootStart);
 
-      // 5. Concurrent batch upsert of related topics and connections
+      // 5. Concurrent batch upsert of related topics and connections with bounded timeout
       const batchUpsertStart = performance.now();
       const createdConnections: Array<{
-        targetTopic: { id: string; title: string; category: string | null; summary: string | null; depth: number | null };
+        targetTopic: {
+          id: string;
+          title: string;
+          category: string | null;
+          summary: string | null;
+          depth: number | null;
+        };
         relationship: string;
       }> = [];
       const newGraphNodes: Array<{
@@ -311,7 +409,6 @@ export async function POST(req: NextRequest) {
         value: number;
       }> = [];
 
-      // Parallel execution prevents serial round-trip latency
       const connectionPromises = expansion.relatedTopics.map(async (rel) => {
         try {
           const targetTopic = await prisma.topic.upsert({
@@ -340,7 +437,7 @@ export async function POST(req: NextRequest) {
               create: {
                 sourceTopicId: rootTopic.id,
                 targetTopicId: targetTopic.id,
-                relationship: rel.relationship || "Connected Frontier",
+                relationship: rel.relationship || "Connected Concept",
                 weight: 1.0,
               },
               update: {
@@ -348,7 +445,11 @@ export async function POST(req: NextRequest) {
               },
             });
 
-            return { targetTopic, connection, relationship: rel.relationship || "Connected Frontier" };
+            return {
+              targetTopic,
+              connection,
+              relationship: rel.relationship || "Connected Concept",
+            };
           }
         } catch (linkErr) {
           console.warn(`[Batch Link] Failed to link "${rel.title}":`, sanitizeConnectionError(linkErr));
@@ -356,7 +457,7 @@ export async function POST(req: NextRequest) {
         return null;
       });
 
-      const batchResults = await Promise.all(connectionPromises);
+      const batchResults = await withDbTimeout(Promise.all(connectionPromises), 1800, []);
       for (const res of batchResults) {
         if (res) {
           createdConnections.push({
@@ -384,7 +485,7 @@ export async function POST(req: NextRequest) {
       const batchUpsertMs = Math.round(performance.now() - batchUpsertStart);
       console.log(`[Parallel DB Upsert] Linked ${createdConnections.length} nodes in ${batchUpsertMs}ms`);
 
-      // 6. Record exploration step in history
+      // 6. Record exploration step in history asynchronously
       if (sessionId) {
         prisma.explorationHistory
           .create({ data: { sessionId, topicId: rootTopic.id } })
@@ -392,7 +493,11 @@ export async function POST(req: NextRequest) {
       }
 
       const totalRouteMs = Math.round(performance.now() - routeStart);
-      console.log(`[Timing Summary] "${topicTitle}" total: ${totalRouteMs}ms (DB lookup: ${dbLookupMs}ms, AI: ${aiMs}ms, DB root update: ${updateRootMs}ms, Parallel DB batch: ${batchUpsertMs}ms)`);
+      const frontendDuration = clientStartMs ? Math.round(Date.now() - clientStartMs) : null;
+
+      console.log(
+        `[Timing Summary] "${topicTitle}" total: ${totalRouteMs}ms (DB lookup: ${dbLookupMs}ms, AI: ${aiMs}ms [${expansion.timing?.modelUsed}], DB root update: ${updateRootMs}ms, Parallel DB batch: ${batchUpsertMs}ms)`
+      );
 
       const finalResponse = {
         source: "aiven",
@@ -404,6 +509,17 @@ export async function POST(req: NextRequest) {
         newGraphNodes,
         newGraphLinks,
         latencyMs: totalRouteMs,
+        telemetry: {
+          totalApiMs: totalRouteMs,
+          frontendRequestDurationMs: frontendDuration,
+          dbLookupMs,
+          geminiMs: expansion.timing?.durationMs || aiMs,
+          geminiAttempts: expansion.timing?.attempts || 1,
+          geminiModel: expansion.timing?.modelUsed || "none",
+          usedFallback: expansion.timing?.usedFallback || false,
+          dbRootUpdateMs: updateRootMs,
+          dbRelatedUpsertMs: batchUpsertMs,
+        },
       };
 
       // Store in memory cache
@@ -420,11 +536,13 @@ export async function POST(req: NextRequest) {
       // Fast fallback to Gemini expansion if Aiven connection has issues
       const expansion = await expandTopicWithGemini(topicTitle, []);
       const totalRouteMs = Math.round(performance.now() - routeStart);
+      const frontendDuration = clientStartMs ? Math.round(Date.now() - clientStartMs) : null;
 
       return NextResponse.json({
         source: "offline-fallback",
         databaseStatus: "offline",
-        warning: "Database is temporarily slow or offline. Generated topics are temporary and not saved permanently.",
+        warning:
+          "Database is temporarily slow or offline. Generated topics are temporary and not saved permanently.",
         topic: {
           id: `virtual-${Date.now()}`,
           title: expansion.title,
@@ -443,6 +561,17 @@ export async function POST(req: NextRequest) {
           relationship: rt.relationship,
         })),
         latencyMs: totalRouteMs,
+        telemetry: {
+          totalApiMs: totalRouteMs,
+          frontendRequestDurationMs: frontendDuration,
+          dbLookupMs: 0,
+          geminiMs: expansion.timing?.durationMs || 0,
+          geminiAttempts: expansion.timing?.attempts || 1,
+          geminiModel: expansion.timing?.modelUsed || "none",
+          usedFallback: expansion.timing?.usedFallback || false,
+          dbRootUpdateMs: 0,
+          dbRelatedUpsertMs: 0,
+        },
       });
     }
   } catch (err) {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { ai } from "./client";
-import { EXPLORATION_PREVIEWS } from "@/lib/data/curatedTopics";
+import { getCuratedTopic } from "@/lib/data/curatedTopics";
 
 // Zod schema for individual related topic connection
 export const RelatedTopicSchema = z.object({
@@ -13,108 +13,273 @@ export const RelatedTopicSchema = z.object({
 // Zod schema for validating structured topic expansion
 export const TopicExpansionSchema = z.object({
   title: z.string().min(1),
-  category: z.string().default("Cosmic Frontier"),
+  category: z.string().default("General Knowledge"),
   description: z.string().default(""),
   summary: z.string().min(1),
-  facts: z.array(z.string()).default([]),
-  exploreNext: z.array(z.string()).default([]),
+  facts: z.array(z.string()).min(2),
+  exploreNext: z.array(z.string()).min(2),
   relatedTopics: z.array(RelatedTopicSchema).min(3).max(10),
+  isFallback: z.boolean().optional().default(false),
+  fallbackReason: z.string().optional(),
 });
 
 export type TopicExpansionResult = z.infer<typeof TopicExpansionSchema>;
 
-// Primary fast model optimized for low latency and high availability
-const PRIMARY_MODEL = "gemini-3.5-flash-lite";
+export interface GeminiExpansionOutput extends TopicExpansionResult {
+  timing: {
+    durationMs: number;
+    attempts: number;
+    modelUsed: string;
+    usedFallback: boolean;
+  };
+}
 
-// Bounded timeouts for serverless execution: prevents requests from hanging for minutes
+// Resilient priority order of verified operational models
+const CANDIDATE_MODELS = [
+  "gemini-3.5-flash-lite",
+  "gemini-3.5-flash",
+];
+
+// Timeout budgets preventing requests from hanging serverless lambdas.
+// Coordinated to allow failover within a strict 5.0s maximum AI budget.
 const PER_ATTEMPT_TIMEOUT_MS = 4000;
-const MAX_TOTAL_GEMINI_TIME_MS = 5500;
+const MAX_TOTAL_GEMINI_TIME_MS = 5000;
+
+// Domain frontier pools for deep expansion without duplicates
+const DOMAIN_EXTENSIONS: Record<string, Array<{ title: string; relationship: string; category: string; summary: string }>> = {
+  astronomy: [
+    { title: "Asteroid Belt", relationship: "Orbital reservoir between Mars and Jupiter supplying rocky impactors", category: "Planetary Science", summary: "The circumferential disc in the Solar System located between the orbits of Mars and Jupiter." },
+    { title: "Kuiper Belt", relationship: "Circumstellar disc of icy bodies beyond Neptune source of short-period comets", category: "Planetary Science", summary: "The vast outer solar system ring of primordial icy remnants and dwarf planets." },
+    { title: "Near-Earth Objects", relationship: "Asteroids and comets with perihelion distances bringing them near Earth's orbit", category: "Planetary Defense", summary: "Solar system bodies whose trajectories bring them into proximity with Earth's orbit." },
+    { title: "Spectroscopy", relationship: "Analytical technique measuring emission spectra of vaporized meteors and stars", category: "Observational Astronomy", summary: "Analyzing light wavelengths to determine the elemental composition and temperature of celestial phenomena." },
+    { title: "Barringer Crater", relationship: "Well-preserved Arizona impact crater formed by a nickel-iron meteorite", category: "Geophysics", summary: "A classic 1.2-kilometer meteorite crater formed approximately 50,000 years ago in Arizona." },
+    { title: "Chicxulub Impact", relationship: "Cretaceous-Paleogene boundary impact event that caused the non-avian dinosaur extinction", category: "Earth History", summary: "The catastrophic 10-kilometer asteroid impact on the Yucatan peninsula 66 million years ago." },
+  ],
+  physics: [
+    { title: "General Relativity", relationship: "Geometric theory of gravitation describing curved spacetime", category: "Theoretical Physics", summary: "Einstein's gravitational theory linking spacetime curvature to mass and energy." },
+    { title: "Gravitational Lensing", relationship: "Deflection of light by extreme gravitational masses", category: "Observational Astrophysics", summary: "The bending of electromagnetic radiation around massive celestial structures." },
+    { title: "Neutron Stars", relationship: "Ultra-dense stellar remnants formed by gravitational collapse of massive stars", category: "High Energy Astrophysics", summary: "Extremely compact stellar cores supported by neutron degeneracy pressure." },
+    { title: "Pulsars", relationship: "Highly magnetized rotating neutron stars emitting beams of electromagnetic radiation", category: "Radio Astronomy", summary: "Rapidly spinning neutron stars with precise periodic radiation pulses." },
+    { title: "Tidal Disruption Events", relationship: "Destruction of a star passing too close to a supermassive black hole", category: "Relativistic Astrophysics", summary: "Luminous transient flares caused when supermassive black holes shred approaching stars." },
+    { title: "Quasars", relationship: "Extremely luminous active galactic nuclei powered by supermassive black holes", category: "Extragalactic Astronomy", summary: "The most energetic astronomical objects, radiating immense power across all wavelengths." },
+  ],
+  computing: [
+    { title: "Algorithm Design", relationship: "Methodological blueprint for computationally solving formal problems", category: "Computer Science", summary: "Techniques for structuring efficient computational procedures and optimization." },
+    { title: "Computational Complexity", relationship: "Classification of computational problems based on resource demands", category: "Theoretical Computer Science", summary: "The rigorous mathematical study of time and space bounds for algorithms." },
+    { title: "Vector Embeddings", relationship: "High-dimensional geometric representations of semantic information", category: "Machine Learning", summary: "Mapping discrete concepts into continuous vector spaces to capture semantic similarity." },
+    { title: "Graph Neural Networks", relationship: "Deep learning models processing relational and topological graph data", category: "Artificial Intelligence", summary: "Neural network architectures specialized for operating directly on graphs and networks." },
+  ],
+  biology: [
+    { title: "Cellular Respiration", relationship: "Complementary metabolic pathway oxidizing sugars to generate ATP", category: "Metabolic Biochemistry", summary: "The biochemical process by which aerobic organisms extract energy from organic molecules." },
+    { title: "Carbon Cycle", relationship: "Global biogeochemical cycle exchanging carbon across atmosphere, ocean, and biosphere", category: "Earth System Science", summary: "The movement of carbon between living biomass, geologic strata, and the atmosphere." },
+    { title: "Stomata Regulation", relationship: "Microscopic leaf pores controlling carbon dioxide uptake and water transpiration", category: "Plant Physiology", summary: "Specialized epidermal valve cells balancing photosynthetic gas exchange and hydration." },
+    { title: "Endosymbiotic Theory", relationship: "Evolutionary origin of chloroplasts and mitochondria from engulfed bacteria", category: "Evolutionary Biology", summary: "The landmark theory showing eukaryotic organelles evolved from symbiotic prokaryotes." },
+  ],
+};
+
+// Boilerplate template patterns that signify low-quality filler AI responses
+const PLACEHOLDER_PATTERNS = [
+  /challenges classical assumptions about how spacetime/i,
+  /sits at the crossroad of fundamental theory/i,
+  /deep inquiry into .* consistently reveals nonlinear relationships/i,
+  /theoretical perspectives on .* challenge conventional boundary/i,
+  /could .* be an emergent manifestation of holographic spacetime/i,
+  /unexpected implications across physical and philosophical boundaries/i,
+  /profound intersections between physical reality, consciousness, and computational/i,
+];
+
+// Unwarranted buzzwords to flag when a topic is non-physics / non-cosmology
+const UNWARRANTED_BUZZWORDS = [
+  "quantum entanglement",
+  "holographic spacetime",
+  "quantum gravity",
+  "bostrom's trilemma",
+  "multiverse interpretation",
+  "event horizon",
+];
 
 /**
- * Builds the fallback expansion result deterministically.
- * Guarantees a rich, schema-compliant discovery in 0ms without external API dependencies.
+ * Validates the quality and scientific relevance of the generated expansion.
+ * Ensures facts are topic-specific, non-repetitive, and not boilerplate template text.
+ */
+export function validateQualityAndRelevance(
+  data: TopicExpansionResult,
+  topicTitle: string
+): { isValid: boolean; issues: string[] } {
+  const issues: string[] = [];
+  const normalizedTitle = topicTitle.toLowerCase().trim();
+
+  // 1. Detect generic placeholder filler in summary or facts
+  const allText = [data.summary, ...(data.facts || []), ...(data.exploreNext || [])].join(" ");
+  for (const pattern of PLACEHOLDER_PATTERNS) {
+    if (pattern.test(allText)) {
+      issues.push(`Detected generic placeholder template matching ${pattern}`);
+    }
+  }
+
+  // 2. Fact count and uniqueness check
+  if (!data.facts || data.facts.length < 3) {
+    issues.push(`Insufficient facts count: ${data.facts?.length || 0} (minimum 3 required)`);
+  } else {
+    const uniqueFacts = new Set(data.facts.map((f) => f.trim().toLowerCase()));
+    if (uniqueFacts.size < data.facts.length) {
+      issues.push("Duplicate or redundant facts detected");
+    }
+  }
+
+  // 3. Related topics count and relevance check
+  if (!data.relatedTopics || data.relatedTopics.length < 4) {
+    issues.push(`Insufficient related topics: ${data.relatedTopics?.length || 0} (minimum 4 required)`);
+  } else {
+    // Check for duplicate related topic titles
+    const uniqueRelTitles = new Set(data.relatedTopics.map((rt) => rt.title.trim().toLowerCase()));
+    if (uniqueRelTitles.size < data.relatedTopics.length) {
+      issues.push("Duplicate related topics detected");
+    }
+
+    // Flag unwarranted cosmic/quantum buzzwords if topic is clearly non-physics
+    const isPhysicsTopic = [
+      "quantum",
+      "physics",
+      "cosmolog",
+      "black hole",
+      "spacetime",
+      "relativity",
+      "gravity",
+      "string theory",
+      "thermodynamics",
+    ].some((k) => normalizedTitle.includes(k) || data.category.toLowerCase().includes(k));
+
+    if (!isPhysicsTopic) {
+      for (const rt of data.relatedTopics) {
+        const rtLower = rt.title.toLowerCase();
+        if (UNWARRANTED_BUZZWORDS.some((b) => rtLower.includes(b))) {
+          issues.push(`Unwarranted conceptual jump: "${rt.title}" attached to non-physics topic "${topicTitle}"`);
+        }
+      }
+    }
+  }
+
+  return {
+    isValid: issues.length === 0,
+    issues,
+  };
+}
+
+/**
+ * Builds a deterministic fallback result.
+ * If curated data exists for the topic, returns genuine scientific facts & relationships.
+ * If unfamiliar, returns an honest preview without fabricating scientific claims.
  */
 export function buildCuratedFallback(
   topicTitle: string,
   existingConnectionTitles: string[] = []
 ): TopicExpansionResult {
-  const slug = topicTitle.toLowerCase().replace(/\s+/g, "-");
-  const curated = EXPLORATION_PREVIEWS[slug];
-
-  const candidateRelated = curated?.relatedNodes || [
-    "Quantum Entanglement",
-    "Information Theory",
-    "Cosmic Inflation",
-    "Bostrom's Trilemma",
-    "Event Horizons",
-    "Entropy and Time",
-    "Neural Complexity",
-  ];
-
-  // Filter out existing connections to prevent duplicates
+  const curated = getCuratedTopic(topicTitle);
   const existingSet = new Set(existingConnectionTitles.map((t) => t.toLowerCase()));
-  const filtered = candidateRelated.filter((title) => !existingSet.has(title.toLowerCase()));
 
-  // Dynamically augment with domain frontiers if existing connections already saturated the primary list
-  const pool = [...filtered];
-  const frontierExtensions = [
-    "Holographic Principle",
-    "Thermodynamic Entropy",
-    "Information Geometry",
-    "Quantum Foam",
-    "Non-Equilibrium Dynamics",
-    "Emergent Gravity",
-    "Topological Matter",
-    "String Theory Landscapes",
-    "Cosmic Topology",
-    "Quantum Decoherence",
-  ];
+  if (curated) {
+    // Filter out connections already created for this node to prevent duplicates
+    const pool = curated.relatedTopics.filter(
+      (rt) => !existingSet.has(rt.title.toLowerCase())
+    );
 
-  for (const ext of frontierExtensions) {
-    if (pool.length >= 6) break;
-    if (!existingSet.has(ext.toLowerCase()) && !pool.some((p) => p.toLowerCase() === ext.toLowerCase())) {
-      pool.push(ext);
+    // If existing connections already saturated the primary list, draw from domain extension pool
+    if (pool.length < 4) {
+      const catLower = curated.category.toLowerCase();
+      let domainKey = "astronomy";
+      if (catLower.includes("physics") || catLower.includes("spacetime") || catLower.includes("black hole")) {
+        domainKey = "physics";
+      } else if (catLower.includes("comput") || catLower.includes("intelligence") || catLower.includes("neural")) {
+        domainKey = "computing";
+      } else if (catLower.includes("bio") || catLower.includes("plant") || catLower.includes("life")) {
+        domainKey = "biology";
+      }
+
+      const extensions = DOMAIN_EXTENSIONS[domainKey] || DOMAIN_EXTENSIONS.astronomy;
+      for (const ext of extensions) {
+        if (pool.length >= 6) break;
+        if (!existingSet.has(ext.title.toLowerCase()) && !pool.some((p) => p.title.toLowerCase() === ext.title.toLowerCase())) {
+          pool.push(ext);
+        }
+      }
     }
+
+    const relatedTopics = (pool.length > 0 ? pool : curated.relatedTopics).slice(0, 8);
+
+    return {
+      title: curated.title,
+      category: curated.category,
+      description: curated.description,
+      summary: curated.summary,
+      facts: curated.facts,
+      exploreNext: curated.exploreNext,
+      relatedTopics,
+      isFallback: true,
+      fallbackReason: "curated_archive",
+    };
   }
 
-  const fallbackRelated = pool.slice(0, 7).map((title) => ({
-    title,
-    relationship: "Interconnected Frontier",
-    category: curated?.category || "Cosmic Frontier",
-    summary: `Exploring the unexpected theoretical bridges between ${topicTitle} and ${title}.`,
-  }));
-
+  // Honest, non-fabricated fallback for unfamiliar topics
+  const titleCap = topicTitle.trim().charAt(0).toUpperCase() + topicTitle.trim().slice(1);
   return {
-    title: topicTitle,
-    category: curated?.category || "Cosmic Frontier",
-    description: `A frontier inquiry into ${topicTitle} and its unexpected implications across physical and philosophical boundaries.`,
-    summary:
-      curated?.summary ||
-      `Exploration of ${topicTitle} reveals profound intersections between physical reality, consciousness, and computational information.`,
+    title: titleCap,
+    category: "General Knowledge & Inquiry",
+    description: `Foundational inquiry entry for "${titleCap}".`,
+    summary: `Dynamic AI synthesis for "${titleCap}" is temporarily unavailable due to network or demand constraints. The exploratory nodes below present foundational discovery vectors.`,
     facts: [
-      `${topicTitle} challenges classical assumptions about how spacetime, entropy, and information behave.`,
-      `Observational breakthroughs continue to reveal anomalous dynamics at the frontier of ${topicTitle}.`,
-      `Theoretical models suggest ${topicTitle} may hold the key to unifying quantum mechanics and gravity.`,
+      `"${titleCap}" is an active topic in the Rabbit Hole knowledge universe awaiting full synthesis.`,
+      `Dynamic multi-disciplinary synthesis will automatically complete when the AI service connection stabilizes.`,
+      `Explore foundational questions and adjacent discovery vectors below to initiate deeper inquiry.`,
     ],
     exploreNext: [
-      `What happens to quantum information at the extreme boundaries of ${topicTitle}?`,
-      `How does an observer's frame of reference transform understanding of ${topicTitle}?`,
-      `Could ${topicTitle} be an emergent manifestation of holographic spacetime?`,
+      `What primary principles or mechanisms define the core of ${titleCap}?`,
+      `How does ${titleCap} intersect with surrounding scientific or philosophical domains?`,
+      `What major historical discoveries or technological breakthroughs shaped our understanding of ${titleCap}?`,
     ],
-    relatedTopics: fallbackRelated.slice(0, 7),
+    relatedTopics: [
+      {
+        title: "Scientific Methodology",
+        relationship: "Epistemic framework for empirical investigation and hypothesis testing",
+        category: "Philosophy of Science",
+        summary: "The systematic pursuit of knowledge through observation, experimentation, and peer verification.",
+      },
+      {
+        title: "Complex Systems",
+        relationship: "Interdisciplinary study of emergent behavior and non-linear interactions",
+        category: "Systems Theory",
+        summary: "How individual components give rise to collective behaviors across physical and biological domains.",
+      },
+      {
+        title: "Information Architecture",
+        relationship: "Structural organization and categorization of interconnected concepts",
+        category: "Cognitive Science",
+        summary: "The structural design of shared information environments and conceptual ontologies.",
+      },
+      {
+        title: "Historical Context",
+        relationship: "Evolutionary timeline and seminal breakthroughs of key concepts",
+        category: "History of Ideas",
+        summary: "Tracing the intellectual lineage and cultural moments that birthed foundational knowledge.",
+      },
+    ].filter((rt) => !existingSet.has(rt.title.toLowerCase())),
+    isFallback: true,
+    fallbackReason: "service_unavailable_honest_fallback",
   };
 }
 
 /**
- * Expands a topic using Google Gemini API or curated fallback.
- * Employs strict per-attempt timeouts, bounded retries on 503, and structured timing logs.
+ * Expands a topic using Google Gemini API with fallback resilience.
+ * Employs strict per-attempt timeouts, model failover, quality validation, and timing telemetry.
  */
 export async function expandTopicWithGemini(
   topicTitle: string,
   existingConnectionTitles: string[] = []
-): Promise<TopicExpansionResult> {
+): Promise<GeminiExpansionOutput> {
   const globalStart = performance.now();
   const apiKey = process.env.GEMINI_API_KEY;
+  let attemptsCount = 0;
+  let lastUsedModel = "none";
 
   if (apiKey && !apiKey.startsWith("your_") && apiKey.length > 10) {
     const existingListStr =
@@ -122,67 +287,71 @@ export async function expandTopicWithGemini(
         ? existingConnectionTitles.join(", ")
         : "none";
 
-    const prompt = `You are the knowledge synthesis engine for "The Rabbit Hole", an interactive curiosity and knowledge discovery platform.
+    const prompt = `You are a world-class scientific knowledge synthesis engine for "The Rabbit Hole", an interactive curiosity and discovery platform.
 Expand the topic: "${topicTitle}".
 
-Generate structured JSON containing:
-1. "title": Exact or polished name of the topic.
-2. "category": A compelling domain name (e.g. Astrophysics, Quantum Mechanics, Epistemology, Consciousness, Bio-Engineering, Ancient Mysteries, Cybernetics, Philosophy).
-3. "description": A clear 1-2 sentence overview of this subject.
-4. "summary": A fascinating, concise explanation highlighting deep paradoxes, frontier questions, or profound implications.
-5. "facts": An array of 3 mind-bending, verified facts about this topic.
-6. "exploreNext": An array of 3 intriguing questions or thought-provoking rabbit hole threads to explore next.
-7. "relatedTopics": An array of 5 to 7 deeply connected topics that a curious explorer should branch into next.
-   For each related topic, include:
-   - "title": Name of the connected concept.
-   - "relationship": A short phrase describing how it deeply interlinks with "${topicTitle}".
-   - "category": Domain name.
-   - "summary": A concise 1-sentence teaser of this connected concept.
+CRITICAL SCIENTIFIC & TOPIC-GROUNDING REQUIREMENTS:
+1. TOPIC INTEGRITY: Stay strictly grounded in "${topicTitle}". NEVER inject unrelated buzzwords like "quantum mechanics", "quantum gravity", "holographic spacetime", "simulation hypothesis", "consciousness", or "multiverse" UNLESS the topic itself is fundamentally about those subjects.
+2. ACCURACY: Provide true, scientifically and historically grounded explanations. For astronomy/planetary topics (such as meteors), distinguish between meteoroids (in space), meteors (in the atmosphere), and meteorites (on the ground).
+3. FACTS (4 to 6 items): Each fact must be concrete, verifiable, and fascinating. Include specific real-world mechanisms (e.g. ram pressure and atmospheric ablation, plasma trails), historical events/discoveries (e.g. Chelyabinsk superbolide, Tunguska event), parent comets & annual showers (e.g. Perseids from Comet Swift-Tuttle), or planetary impact geology.
+4. RELATED TOPICS (5 to 8 items): Must be genuinely and meaningfully connected to "${topicTitle}".
+   - "relationship": An explanatory phrase describing the exact physical or conceptual connection to "${topicTitle}".
+5. CURIOSITY QUESTIONS (3 to 5 items): Logical, thought-provoking questions that naturally arise from understanding "${topicTitle}".
 
 Do NOT include any of these already connected topics: ${existingListStr}.
 
 Respond ONLY with valid JSON matching this exact structure:
 {
   "title": "${topicTitle}",
-  "category": "Domain",
-  "description": "Clear overview",
-  "summary": "Fascinating concise explanation...",
-  "facts": ["Fact 1", "Fact 2", "Fact 3"],
-  "exploreNext": ["Question 1?", "Question 2?", "Question 3?"],
+  "category": "Appropriate Domain (e.g. Astronomy & Planetary Science, Physics, Evolutionary Biology, Computer Science, History)",
+  "description": "A clear, precise 1-2 sentence definition of what ${topicTitle} actually is.",
+  "summary": "A substantive, compelling 2-3 sentence explanation of why ${topicTitle} matters scientifically, historically, or technologically.",
+  "facts": [
+    "Fact 1",
+    "Fact 2",
+    "Fact 3",
+    "Fact 4"
+  ],
+  "exploreNext": [
+    "Question 1?",
+    "Question 2?",
+    "Question 3?"
+  ],
   "relatedTopics": [
     {
       "title": "Concept Name",
-      "relationship": "How they connect",
+      "relationship": "How they specifically connect",
       "category": "Domain",
-      "summary": "Brief teaser"
+      "summary": "1-sentence summary of this connected concept"
     }
   ]
 }`;
 
-    const maxAttempts = 2;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (const model of CANDIDATE_MODELS) {
       const elapsedSoFar = performance.now() - globalStart;
       const remainingTime = MAX_TOTAL_GEMINI_TIME_MS - elapsedSoFar;
 
-      if (remainingTime < 1500) {
-        console.warn(`[Gemini] Remaining time budget (${Math.round(remainingTime)}ms) too low for another attempt; triggering fallback.`);
+      if (remainingTime < 2000) {
+        console.warn(`[Gemini] Remaining time budget (${Math.round(remainingTime)}ms) insufficient for model ${model}; aborting to fallback.`);
         break;
       }
 
+      attemptsCount++;
+      lastUsedModel = model;
       const attemptTimeout = Math.min(PER_ATTEMPT_TIMEOUT_MS, remainingTime);
       const attemptStart = performance.now();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), attemptTimeout);
 
       try {
-        console.log(`[Gemini] Starting attempt ${attempt}/${maxAttempts} for "${topicTitle}" (model: ${PRIMARY_MODEL}, timeout: ${Math.round(attemptTimeout)}ms)`);
+        console.log(`[Gemini] Starting attempt ${attemptsCount} for "${topicTitle}" (model: ${model}, timeout: ${Math.round(attemptTimeout)}ms)`);
 
         const response = await ai.models.generateContent({
-          model: PRIMARY_MODEL,
+          model,
           contents: prompt,
           config: {
             responseMimeType: "application/json",
+            temperature: 0.25,
             abortSignal: controller.signal,
           },
         });
@@ -193,16 +362,39 @@ Respond ONLY with valid JSON matching this exact structure:
 
         if (responseText) {
           const zodStart = performance.now();
-          const parsedJson = JSON.parse(responseText);
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(responseText);
+          } catch {
+            console.warn(`[Gemini] Model ${model} returned unparseable JSON text`);
+            continue;
+          }
+
           const validated = TopicExpansionSchema.safeParse(parsedJson);
           const zodMs = Math.round(performance.now() - zodStart);
 
           if (validated.success) {
-            const totalMs = Math.round(performance.now() - globalStart);
-            console.log(`[Gemini] SUCCESS for "${topicTitle}" in ${totalMs}ms (API: ${attemptMs}ms, Zod: ${zodMs}ms)`);
-            return validated.data;
+            // Quality and relevance validation
+            const qualityCheck = validateQualityAndRelevance(validated.data, topicTitle);
+
+            if (qualityCheck.isValid) {
+              const totalMs = Math.round(performance.now() - globalStart);
+              console.log(`[Gemini] SUCCESS for "${topicTitle}" in ${totalMs}ms (model: ${model}, API: ${attemptMs}ms, Zod: ${zodMs}ms)`);
+              return {
+                ...validated.data,
+                isFallback: false,
+                timing: {
+                  durationMs: totalMs,
+                  attempts: attemptsCount,
+                  modelUsed: model,
+                  usedFallback: false,
+                },
+              };
+            } else {
+              console.warn(`[Gemini] Response failed quality/relevance check for model ${model}:`, qualityCheck.issues);
+            }
           } else {
-            console.warn(`[Gemini] Response failed Zod validation:`, validated.error.issues);
+            console.warn(`[Gemini] Response failed Zod schema for model ${model}:`, validated.error.issues);
           }
         }
       } catch (err: unknown) {
@@ -212,26 +404,30 @@ Respond ONLY with valid JSON matching this exact structure:
         const msg = err instanceof Error ? err.message : String(err);
         const status = (err as { status?: number }).status;
 
-        console.warn(`[Gemini] Attempt ${attempt} failed in ${attemptMs}ms: ${isAbort ? "TIMED OUT" : `status ${status || msg}`}`);
+        console.warn(`[Gemini] Attempt ${attemptsCount} with model ${model} failed in ${attemptMs}ms: ${isAbort ? "TIMED OUT" : `status ${status || msg}`}`);
 
-        // Do not retry on client-side abort or unrecoverable auth/not-found errors
-        if (isAbort || status === 401 || status === 403 || status === 404) {
-          break;
-        }
-
-        // Brief delay before retry on transient 503 or 429
-        if (attempt < maxAttempts) {
-          await new Promise((r) => setTimeout(r, 350));
+        // Do not retry this model on unrecoverable auth errors
+        if (status === 401 || status === 403 || status === 404) {
+          continue;
         }
       }
     }
   }
 
+  // Trigger rich curated or honest deterministic fallback
   const fallbackStart = performance.now();
   const fallback = buildCuratedFallback(topicTitle, existingConnectionTitles);
   const fallbackMs = Math.round(performance.now() - fallbackStart);
   const totalMs = Math.round(performance.now() - globalStart);
 
-  console.log(`[Gemini] Returned curated fallback for "${topicTitle}" in ${totalMs}ms (fallback gen: ${fallbackMs}ms)`);
-  return fallback;
+  console.log(`[Gemini Fallback] Returned curated/honest fallback for "${topicTitle}" in ${totalMs}ms (fallback gen: ${fallbackMs}ms)`);
+  return {
+    ...fallback,
+    timing: {
+      durationMs: totalMs,
+      attempts: attemptsCount,
+      modelUsed: lastUsedModel,
+      usedFallback: true,
+    },
+  };
 }
