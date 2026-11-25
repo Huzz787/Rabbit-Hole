@@ -277,25 +277,40 @@ async function runQA() {
     );
 
     // -----------------------------------------------------------------
-    // 8. Offline Fallback & Reliability
+    // 8. Offline Fallback & Reliability (Honest Unknown-Topic Fallback)
     // -----------------------------------------------------------------
     console.log("\n--- Testing Offline Fallback ---");
     process.env.GEMINI_API_KEY = "";
     const offlineFallback = await expandTopicWithGemini("Quantum Teleportation", []);
     process.env.GEMINI_API_KEY = apiKey;
 
+    const genericTitles = new Set([
+      "scientific methodology",
+      "complex systems",
+      "information architecture",
+      "historical context",
+    ]);
+    const hasGenericPlaceholders = (offlineFallback?.relatedTopics || []).some((rt) =>
+      genericTitles.has(rt.title.toLowerCase())
+    );
+
     const fallbackWorking = Boolean(
       offlineFallback &&
-      offlineFallback.title &&
-      offlineFallback.relatedTopics.length >= 3 &&
-      offlineFallback.facts.length >= 2
+      offlineFallback.title === "Quantum Teleportation" &&
+      offlineFallback.isFallback === true &&
+      offlineFallback.fallbackReason === "service_unavailable_honest_fallback" &&
+      offlineFallback.relatedTopics.length === 0 &&
+      offlineFallback.facts.length === 0 &&
+      !hasGenericPlaceholders
     );
 
     recordResult(
       "Graceful Offline Fallback",
       "Reliability",
       fallbackWorking,
-      "Synthesizes structured knowledge even during API outages"
+      fallbackWorking
+        ? "Returns honest unavailable response with 0 related topics and no generic placeholders"
+        : `Unexpected fallback payload: rels=${offlineFallback?.relatedTopics?.length}, reason=${offlineFallback?.fallbackReason}`
     );
 
     // -----------------------------------------------------------------

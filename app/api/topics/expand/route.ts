@@ -128,10 +128,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1. Check in-memory cache first (instant response for repeat queries)
-    if (!forceRefresh) {
+    // 1. Check in-memory cache first (instant response for repeat queries; never serve fallback entries)
+    if (forceRefresh) {
+      TOPIC_CACHE.delete(normalizedKey);
+    } else {
       const cached = TOPIC_CACHE.get(normalizedKey);
-      if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      const cachedIsFallback = Boolean(
+        (cached?.payload?.expansion as { isFallback?: boolean } | undefined)?.isFallback
+      );
+      if (cached && !cachedIsFallback && Date.now() - cached.timestamp < CACHE_TTL_MS) {
         const cacheHitMs = Math.round(performance.now() - routeStart);
         console.log(`[Cache Hit] Serving "${topicTitle}" from memory in ${cacheHitMs}ms`);
 
@@ -144,6 +149,7 @@ export async function POST(req: NextRequest) {
         }
 
         const frontendDuration = clientStartMs ? Math.round(Date.now() - clientStartMs) : null;
+        const cachedTelemetry = cached.payload.telemetry as { usedFallback?: boolean } | undefined;
         return NextResponse.json({
           ...cached.payload,
           source: "memory-cache",
@@ -155,7 +161,7 @@ export async function POST(req: NextRequest) {
             geminiMs: 0,
             geminiAttempts: 0,
             geminiModel: "memory-cache",
-            usedFallback: false,
+            usedFallback: Boolean(cachedTelemetry?.usedFallback),
             dbRootUpdateMs: 0,
             dbRelatedUpsertMs: 0,
           },
@@ -367,7 +373,43 @@ export async function POST(req: NextRequest) {
         inFlightExpansions.delete(normalizedKey);
       }
       const aiMs = Math.round(performance.now() - aiStart);
-      console.log(`[AI Gen] Expansion for "${topicTitle}" took ${aiMs}ms (model: ${expansion.timing?.modelUsed}, fallback: ${expansion.timing?.usedFallback})`);
+      const isFallbackResult = Boolean(expansion.isFallback || expansion.timing?.usedFallback);
+      console.log(`[AI Gen] Expansion for "${topicTitle}" took ${aiMs}ms (model: ${expansion.timing?.modelUsed}, fallback: ${isFallbackResult})`);
+
+      // CRITICAL: Never persist fallback-generated content or relationships to Aiven or TOPIC_CACHE
+      if (isFallbackResult) {
+        if (sessionId) {
+          prisma.explorationHistory
+            .create({ data: { sessionId, topicId: rootTopic.id } })
+            .catch(() => {});
+        }
+
+        const totalRouteMs = Math.round(performance.now() - routeStart);
+        const frontendDuration = clientStartMs ? Math.round(Date.now() - clientStartMs) : null;
+
+        return NextResponse.json({
+          source: "fallback",
+          databaseStatus: "connected",
+          rootTopic,
+          expansion,
+          createdCount: 0,
+          connections: [],
+          newGraphNodes: [],
+          newGraphLinks: [],
+          latencyMs: totalRouteMs,
+          telemetry: {
+            totalApiMs: totalRouteMs,
+            frontendRequestDurationMs: frontendDuration,
+            dbLookupMs,
+            geminiMs: expansion.timing?.durationMs || aiMs,
+            geminiAttempts: expansion.timing?.attempts || 0,
+            geminiModel: expansion.timing?.modelUsed || "none",
+            usedFallback: true,
+            dbRootUpdateMs: 0,
+            dbRelatedUpsertMs: 0,
+          },
+        });
+      }
 
       // 4. Update root topic details with bounded timeout (max 1.2s)
       const updateRootStart = performance.now();

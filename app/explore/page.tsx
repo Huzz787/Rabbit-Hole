@@ -57,17 +57,11 @@ function getCuratedDataForTopic(topic: string): TopicData {
   const titleCap = topic.trim().charAt(0).toUpperCase() + topic.trim().slice(1);
   return {
     title: titleCap,
-    category: "General Knowledge",
-    description: `Exploration entry for "${titleCap}".`,
-    summary: `Dynamic synthesis for "${titleCap}" is actively initializing. Foundational discovery pathways are provided below.`,
-    facts: [
-      `"${titleCap}" is an active inquiry node in the knowledge universe.`,
-      `Dynamic multi-disciplinary synthesis will automatically complete when the AI service connection stabilizes.`,
-    ],
-    exploreNext: [
-      `What primary mechanisms or principles define ${titleCap}?`,
-      `How does ${titleCap} connect with surrounding domains?`,
-    ],
+    category: "Unverified Topic",
+    description: `Live AI synthesis for "${titleCap}" is currently unavailable.`,
+    summary: `Dynamic AI synthesis for "${titleCap}" is temporarily unavailable due to Gemini API demand or quota constraints, and no verified curated entry exists for this topic yet. Please retry AI synthesis shortly.`,
+    facts: [],
+    exploreNext: [],
     relatedTopics: [],
     isFallback: true,
   };
@@ -100,8 +94,9 @@ function ExploreContent() {
   useEffect(() => {
     let isMounted = true;
     const controller = new AbortController();
-    // Coordinated with backend maximum budget (9.5s) plus network buffer
-    const CLIENT_TIMEOUT_MS = 11000;
+    // Coordinated with backend worst-case (8.5s Gemini + 4.5s max DB + 0.1s overhead = 13.1s)
+    // and Vercel maxDuration (15s), leaving ~2.4s network transit margin before client aborts.
+    const CLIENT_TIMEOUT_MS = 15500;
     const clientStartTime = Date.now();
 
     const timeoutId = setTimeout(() => {
@@ -160,7 +155,12 @@ function ExploreContent() {
             });
 
             if (isFallback) {
-              setNoticeMessage("Displaying verified curated preview. You can retry dynamic AI synthesis anytime.");
+              const hasCuratedRelations = Array.isArray(data.expansion.relatedTopics) && data.expansion.relatedTopics.length > 0;
+              setNoticeMessage(
+                hasCuratedRelations
+                  ? "Displaying verified curated preview. You can retry dynamic AI synthesis anytime."
+                  : "Dynamic AI synthesis is temporarily unavailable. No verified relationships are available for this topic yet."
+              );
             } else {
               setNoticeMessage(null);
             }
@@ -390,7 +390,7 @@ function ExploreContent() {
               ) : topicData?.isFallback ? (
                 <div className="flex items-center gap-1.5 text-cyan-300 bg-cyan-950/40 px-3 py-1 rounded-full border border-cyan-500/30">
                   <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Curated Preview</span>
+                  <span>{topicData.relatedTopics.length > 0 ? "Curated Preview" : "AI Unavailable"}</span>
                 </div>
               ) : (
                 <div className="flex items-center gap-1.5 text-emerald-400 bg-emerald-950/40 px-3 py-1 rounded-full border border-emerald-500/30">
@@ -499,35 +499,42 @@ function ExploreContent() {
                   <span className="text-xs text-zinc-500">Click any topic to branch deeper</span>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                  {topicData?.relatedTopics.map((rel) => (
-                    <button
-                      key={rel.title}
-                      onClick={() => handleRelatedClick(rel.title)}
-                      className="flex flex-col p-4 rounded-xl bg-white/[0.03] hover:bg-cyan-950/40 border border-white/10 hover:border-cyan-500/40 text-left transition-all group"
-                    >
-                      <div className="flex items-center justify-between w-full">
-                        <div className="flex items-center gap-2.5">
-                          <div className="w-2 h-2 rounded-full bg-cyan-400 group-hover:scale-125 transition-transform" />
-                          <span className="text-sm font-semibold text-zinc-200 group-hover:text-cyan-300 transition-colors">
-                            {rel.title}
-                          </span>
+                {topicData && topicData.relatedTopics.length === 0 ? (
+                  <div className="p-5 rounded-xl bg-white/[0.02] border border-white/10 text-sm text-zinc-400">
+                    No verified topic relationships are available while live AI synthesis is unavailable. Use{" "}
+                    <span className="text-cyan-300 font-medium">Retry AI Synthesis</span> above to try generating live connections.
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                    {topicData?.relatedTopics.map((rel) => (
+                      <button
+                        key={rel.title}
+                        onClick={() => handleRelatedClick(rel.title)}
+                        className="flex flex-col p-4 rounded-xl bg-white/[0.03] hover:bg-cyan-950/40 border border-white/10 hover:border-cyan-500/40 text-left transition-all group"
+                      >
+                        <div className="flex items-center justify-between w-full">
+                          <div className="flex items-center gap-2.5">
+                            <div className="w-2 h-2 rounded-full bg-cyan-400 group-hover:scale-125 transition-transform" />
+                            <span className="text-sm font-semibold text-zinc-200 group-hover:text-cyan-300 transition-colors">
+                              {rel.title}
+                            </span>
+                          </div>
+                          <ArrowRight className="w-4 h-4 text-zinc-500 group-hover:text-cyan-400 group-hover:translate-x-1 transition-all" />
                         </div>
-                        <ArrowRight className="w-4 h-4 text-zinc-500 group-hover:text-cyan-400 group-hover:translate-x-1 transition-all" />
-                      </div>
-                      {rel.relationship && (
-                        <span className="text-[11px] font-mono text-cyan-400/80 mt-1 pl-4.5">
-                          {rel.relationship}
-                        </span>
-                      )}
-                      {rel.summary && (
-                        <p className="text-xs text-zinc-400 mt-1 pl-4.5 line-clamp-2">
-                          {rel.summary}
-                        </p>
-                      )}
-                    </button>
-                  ))}
-                </div>
+                        {rel.relationship && (
+                          <span className="text-[11px] font-mono text-cyan-400/80 mt-1 pl-4.5">
+                            {rel.relationship}
+                          </span>
+                        )}
+                        {rel.summary && (
+                          <p className="text-xs text-zinc-400 mt-1 pl-4.5 line-clamp-2">
+                            {rel.summary}
+                          </p>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}

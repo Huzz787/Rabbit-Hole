@@ -16,9 +16,9 @@ export const TopicExpansionSchema = z.object({
   category: z.string().default("General Knowledge"),
   description: z.string().default(""),
   summary: z.string().min(1),
-  facts: z.array(z.string()).min(2),
-  exploreNext: z.array(z.string()).min(2),
-  relatedTopics: z.array(RelatedTopicSchema).min(3).max(10),
+  facts: z.array(z.string()).default([]),
+  exploreNext: z.array(z.string()).default([]),
+  relatedTopics: z.array(RelatedTopicSchema).max(10).default([]),
   isFallback: z.boolean().optional().default(false),
   fallbackReason: z.string().optional(),
 });
@@ -40,10 +40,15 @@ const CANDIDATE_MODELS = [
   "gemini-3.5-flash",
 ];
 
-// Timeout budgets preventing requests from hanging serverless lambdas.
-// Coordinated to allow failover within a strict 5.0s maximum AI budget.
-const PER_ATTEMPT_TIMEOUT_MS = 4000;
-const MAX_TOTAL_GEMINI_TIME_MS = 5000;
+// Coordinated request budget within Vercel maxDuration = 15s:
+// - Worst-case Aiven DB timeouts in /api/topics/expand: 1500ms (lookup) + 1200ms (root update) + 1800ms (batch upsert) = 4500ms
+// - Serialization + handler overhead: ~100ms
+// - Remaining AI budget: 8500ms -> worst-case backend = 13,100ms (1,900ms headroom under 15,000ms Vercel limit)
+// - Per-attempt timeout: 5000ms so primary can complete structured JSON and secondary still gets >= 3500ms on timeout.
+const PER_ATTEMPT_TIMEOUT_MS = 5000;
+const MAX_TOTAL_GEMINI_TIME_MS = 8500;
+const MIN_REMAINING_TIME_MS = 1800;
+const TRANSIENT_RETRY_DELAY_MS = 350;
 
 // Domain frontier pools for deep expansion without duplicates
 const DOMAIN_EXTENSIONS: Record<string, Array<{ title: string; relationship: string; category: string; summary: string }>> = {
@@ -117,7 +122,7 @@ export function validateQualityAndRelevance(
     }
   }
 
-  // 2. Fact count and uniqueness check
+  // 2. Fact and curiosity question count / uniqueness check
   if (!data.facts || data.facts.length < 3) {
     issues.push(`Insufficient facts count: ${data.facts?.length || 0} (minimum 3 required)`);
   } else {
@@ -125,6 +130,10 @@ export function validateQualityAndRelevance(
     if (uniqueFacts.size < data.facts.length) {
       issues.push("Duplicate or redundant facts detected");
     }
+  }
+
+  if (!data.exploreNext || data.exploreNext.length < 2) {
+    issues.push(`Insufficient curiosity questions count: ${data.exploreNext?.length || 0} (minimum 2 required)`);
   }
 
   // 3. Related topics count and relevance check
@@ -220,49 +229,16 @@ export function buildCuratedFallback(
     };
   }
 
-  // Honest, non-fabricated fallback for unfamiliar topics
+  // Honest, non-fabricated fallback for unfamiliar topics (never invent relationships or facts)
   const titleCap = topicTitle.trim().charAt(0).toUpperCase() + topicTitle.trim().slice(1);
   return {
     title: titleCap,
-    category: "General Knowledge & Inquiry",
-    description: `Foundational inquiry entry for "${titleCap}".`,
-    summary: `Dynamic AI synthesis for "${titleCap}" is temporarily unavailable due to network or demand constraints. The exploratory nodes below present foundational discovery vectors.`,
-    facts: [
-      `"${titleCap}" is an active topic in the Rabbit Hole knowledge universe awaiting full synthesis.`,
-      `Dynamic multi-disciplinary synthesis will automatically complete when the AI service connection stabilizes.`,
-      `Explore foundational questions and adjacent discovery vectors below to initiate deeper inquiry.`,
-    ],
-    exploreNext: [
-      `What primary principles or mechanisms define the core of ${titleCap}?`,
-      `How does ${titleCap} intersect with surrounding scientific or philosophical domains?`,
-      `What major historical discoveries or technological breakthroughs shaped our understanding of ${titleCap}?`,
-    ],
-    relatedTopics: [
-      {
-        title: "Scientific Methodology",
-        relationship: "Epistemic framework for empirical investigation and hypothesis testing",
-        category: "Philosophy of Science",
-        summary: "The systematic pursuit of knowledge through observation, experimentation, and peer verification.",
-      },
-      {
-        title: "Complex Systems",
-        relationship: "Interdisciplinary study of emergent behavior and non-linear interactions",
-        category: "Systems Theory",
-        summary: "How individual components give rise to collective behaviors across physical and biological domains.",
-      },
-      {
-        title: "Information Architecture",
-        relationship: "Structural organization and categorization of interconnected concepts",
-        category: "Cognitive Science",
-        summary: "The structural design of shared information environments and conceptual ontologies.",
-      },
-      {
-        title: "Historical Context",
-        relationship: "Evolutionary timeline and seminal breakthroughs of key concepts",
-        category: "History of Ideas",
-        summary: "Tracing the intellectual lineage and cultural moments that birthed foundational knowledge.",
-      },
-    ].filter((rt) => !existingSet.has(rt.title.toLowerCase())),
+    category: "Unverified Topic",
+    description: `Live AI synthesis for "${titleCap}" is currently unavailable.`,
+    summary: `Dynamic AI synthesis for "${titleCap}" is temporarily unavailable due to Gemini API demand or quota constraints, and no verified curated entry exists for this topic yet. Please retry AI synthesis shortly.`,
+    facts: [],
+    exploreNext: [],
+    relatedTopics: [],
     isFallback: true,
     fallbackReason: "service_unavailable_honest_fallback",
   };
@@ -328,87 +304,97 @@ Respond ONLY with valid JSON matching this exact structure:
 }`;
 
     for (const model of CANDIDATE_MODELS) {
-      const elapsedSoFar = performance.now() - globalStart;
-      const remainingTime = MAX_TOTAL_GEMINI_TIME_MS - elapsedSoFar;
+      for (let modelRetry = 0; modelRetry < 2; modelRetry++) {
+        const elapsedSoFar = performance.now() - globalStart;
+        const remainingTime = MAX_TOTAL_GEMINI_TIME_MS - elapsedSoFar;
 
-      if (remainingTime < 2000) {
-        console.warn(`[Gemini] Remaining time budget (${Math.round(remainingTime)}ms) insufficient for model ${model}; aborting to fallback.`);
-        break;
-      }
+        if (remainingTime < MIN_REMAINING_TIME_MS) {
+          console.warn(`[Gemini] Remaining time budget (${Math.round(remainingTime)}ms) insufficient for model ${model}; aborting to fallback.`);
+          break;
+        }
 
-      attemptsCount++;
-      lastUsedModel = model;
-      const attemptTimeout = Math.min(PER_ATTEMPT_TIMEOUT_MS, remainingTime);
-      const attemptStart = performance.now();
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), attemptTimeout);
+        attemptsCount++;
+        lastUsedModel = model;
+        const attemptTimeout = Math.min(PER_ATTEMPT_TIMEOUT_MS, remainingTime);
+        const attemptStart = performance.now();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), attemptTimeout);
 
-      try {
-        console.log(`[Gemini] Starting attempt ${attemptsCount} for "${topicTitle}" (model: ${model}, timeout: ${Math.round(attemptTimeout)}ms)`);
+        try {
+          console.log(`[Gemini] Starting attempt ${attemptsCount} for "${topicTitle}" (model: ${model}, timeout: ${Math.round(attemptTimeout)}ms)`);
 
-        const response = await ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-            temperature: 0.25,
-            abortSignal: controller.signal,
-          },
-        });
+          const response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              temperature: 0.25,
+              abortSignal: controller.signal,
+            },
+          });
 
-        clearTimeout(timer);
-        const attemptMs = Math.round(performance.now() - attemptStart);
-        const responseText = response.text;
+          clearTimeout(timer);
+          const attemptMs = Math.round(performance.now() - attemptStart);
+          const responseText = response.text;
 
-        if (responseText) {
-          const zodStart = performance.now();
-          let parsedJson: unknown;
-          try {
-            parsedJson = JSON.parse(responseText);
-          } catch {
-            console.warn(`[Gemini] Model ${model} returned unparseable JSON text`);
+          if (responseText) {
+            const zodStart = performance.now();
+            let parsedJson: unknown;
+            try {
+              parsedJson = JSON.parse(responseText);
+            } catch {
+              console.warn(`[Gemini] Model ${model} returned unparseable JSON text`);
+              break;
+            }
+
+            const validated = TopicExpansionSchema.safeParse(parsedJson);
+            const zodMs = Math.round(performance.now() - zodStart);
+
+            if (validated.success) {
+              // Quality and relevance validation
+              const qualityCheck = validateQualityAndRelevance(validated.data, topicTitle);
+
+              if (qualityCheck.isValid) {
+                const totalMs = Math.round(performance.now() - globalStart);
+                console.log(`[Gemini] SUCCESS for "${topicTitle}" in ${totalMs}ms (model: ${model}, API: ${attemptMs}ms, Zod: ${zodMs}ms)`);
+                return {
+                  ...validated.data,
+                  isFallback: false,
+                  timing: {
+                    durationMs: totalMs,
+                    attempts: attemptsCount,
+                    modelUsed: model,
+                    usedFallback: false,
+                  },
+                };
+              } else {
+                console.warn(`[Gemini] Response failed quality/relevance check for model ${model}:`, qualityCheck.issues);
+                break;
+              }
+            } else {
+              console.warn(`[Gemini] Response failed Zod schema for model ${model}:`, validated.error.issues);
+              break;
+            }
+          }
+          break;
+        } catch (err: unknown) {
+          clearTimeout(timer);
+          const attemptMs = Math.round(performance.now() - attemptStart);
+          const isAbort = err instanceof Error && (err.name === "AbortError" || err.message.includes("aborted"));
+          const msg = err instanceof Error ? err.message : String(err);
+          const status = (err as { status?: number }).status;
+
+          console.warn(`[Gemini] Attempt ${attemptsCount} with model ${model} failed in ${attemptMs}ms: ${isAbort ? "TIMED OUT" : `status ${status || msg}`}`);
+
+          // Only retry once on transient 503 if sufficient budget remains for secondary failover
+          const remainingAfterErr = MAX_TOTAL_GEMINI_TIME_MS - (performance.now() - globalStart);
+          if (status === 503 && modelRetry === 0 && remainingAfterErr >= 3800) {
+            await new Promise((r) => setTimeout(r, TRANSIENT_RETRY_DELAY_MS));
             continue;
           }
 
-          const validated = TopicExpansionSchema.safeParse(parsedJson);
-          const zodMs = Math.round(performance.now() - zodStart);
-
-          if (validated.success) {
-            // Quality and relevance validation
-            const qualityCheck = validateQualityAndRelevance(validated.data, topicTitle);
-
-            if (qualityCheck.isValid) {
-              const totalMs = Math.round(performance.now() - globalStart);
-              console.log(`[Gemini] SUCCESS for "${topicTitle}" in ${totalMs}ms (model: ${model}, API: ${attemptMs}ms, Zod: ${zodMs}ms)`);
-              return {
-                ...validated.data,
-                isFallback: false,
-                timing: {
-                  durationMs: totalMs,
-                  attempts: attemptsCount,
-                  modelUsed: model,
-                  usedFallback: false,
-                },
-              };
-            } else {
-              console.warn(`[Gemini] Response failed quality/relevance check for model ${model}:`, qualityCheck.issues);
-            }
-          } else {
-            console.warn(`[Gemini] Response failed Zod schema for model ${model}:`, validated.error.issues);
-          }
-        }
-      } catch (err: unknown) {
-        clearTimeout(timer);
-        const attemptMs = Math.round(performance.now() - attemptStart);
-        const isAbort = err instanceof Error && (err.name === "AbortError" || err.message.includes("aborted"));
-        const msg = err instanceof Error ? err.message : String(err);
-        const status = (err as { status?: number }).status;
-
-        console.warn(`[Gemini] Attempt ${attemptsCount} with model ${model} failed in ${attemptMs}ms: ${isAbort ? "TIMED OUT" : `status ${status || msg}`}`);
-
-        // Do not retry this model on unrecoverable auth errors
-        if (status === 401 || status === 403 || status === 404) {
-          continue;
+          // Do not retry 401/403/404/429 or timeouts on the same model; fail over to next model
+          break;
         }
       }
     }
